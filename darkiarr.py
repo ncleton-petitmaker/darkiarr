@@ -1042,8 +1042,8 @@ def _build_release_name(title_name, year, quality_str, lang_tag, episode_tag="")
         parts.append(episode_tag)
     parts.append(lang_tag)
     parts.append(quality_str)
-    parts.append("DarkiWorld")
-    return ".".join(parts)
+    base = ".".join(parts)
+    return f"{base}-DarkiWorld"
 
 
 def _get_base_url():
