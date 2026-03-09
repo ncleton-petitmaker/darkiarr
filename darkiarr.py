@@ -303,24 +303,25 @@ class BrowserSession:
 
     def _do_login(self, token):
         """Attempt login with a Turnstile token. Returns True on success."""
-        result = self.driver.execute_async_script("""
+        xsrf_js = self._get_xsrf_token_js()
+        result = self.driver.execute_async_script(f"""
             var cb = arguments[arguments.length - 1];
-            fetch('/auth/login', {
+            var xsrf = {xsrf_js};
+            if (!xsrf) {{ cb({{error: 'XSRF-TOKEN missing for login'}}); return; }}
+            fetch('/auth/login', {{
                 method: 'POST',
-                headers: {
+                headers: {{
                     'Content-Type': 'application/json',
                     'Accept': 'application/json',
-                    'X-XSRF-TOKEN': decodeURIComponent(
-                        document.cookie.match(/XSRF-TOKEN=([^;]+)/)[1]
-                    ),
+                    'X-XSRF-TOKEN': decodeURIComponent(xsrf),
                     'X-Requested-With': 'XMLHttpRequest'
-                },
-                body: JSON.stringify({
+                }},
+                body: JSON.stringify({{
                     email: arguments[0],
                     password: arguments[1],
                     token: arguments[2]
-                })
-            }).then(r => r.json()).then(d => cb(d)).catch(e => cb({error: e.message}));
+                }})
+            }}).then(r => r.json()).then(d => cb(d)).catch(e => cb({{error: e.message}}));
         """, DW_EMAIL, DW_PASSWORD, token)
 
         if not result or "errors" in result:
@@ -360,42 +361,64 @@ class BrowserSession:
         print("[browser] WARNING: All login attempts failed, continuing anyway")
         self.logged_in = True  # Allow degraded operation
 
+    def _get_xsrf_token_js(self):
+        """JS snippet that safely extracts XSRF-TOKEN from cookies."""
+        return "(document.cookie.match(/XSRF-TOKEN=([^;]+)/)||[])[1]"
+
+    def _has_xsrf_token(self):
+        """Check if the browser still has an XSRF-TOKEN cookie."""
+        token = self.driver.execute_script(
+            f"return {self._get_xsrf_token_js()}"
+        )
+        return bool(token)
+
+    def _ensure_session(self):
+        """Re-login if the session has expired (no XSRF-TOKEN cookie)."""
+        if not self._has_xsrf_token():
+            print("[browser] XSRF-TOKEN missing, session expired - re-logging in...")
+            self.logged_in = False
+            self._login()
+
     def api_get(self, path, params=None):
         with self._lock:
+            self._ensure_session()
             qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in (params or {}).items())
             url = f"/api/v1/{path}" + (f"?{qs}" if qs else "")
-            result = self.driver.execute_async_script("""
+            xsrf_js = self._get_xsrf_token_js()
+            result = self.driver.execute_async_script(f"""
                 var cb = arguments[arguments.length - 1];
-                fetch(arguments[0], {
-                    headers: {
+                var token = {xsrf_js};
+                if (!token) {{ cb({{error: 'XSRF-TOKEN missing'}}); return; }}
+                fetch(arguments[0], {{
+                    headers: {{
                         'Accept': 'application/json',
-                        'X-XSRF-TOKEN': decodeURIComponent(
-                            document.cookie.match(/XSRF-TOKEN=([^;]+)/)[1]
-                        ),
+                        'X-XSRF-TOKEN': decodeURIComponent(token),
                         'X-Requested-With': 'XMLHttpRequest'
-                    }
-                }).then(r => r.json()).then(d => cb(d)).catch(e => cb({error: e.message}));
+                    }}
+                }}).then(r => r.json()).then(d => cb(d)).catch(e => cb({{error: e.message}}));
             """, url)
             return result
 
     def api_post(self, path, body=None):
         with self._lock:
-            result = self.driver.execute_async_script("""
+            self._ensure_session()
+            xsrf_js = self._get_xsrf_token_js()
+            result = self.driver.execute_async_script(f"""
                 var cb = arguments[arguments.length - 1];
-                fetch('/api/v1/' + arguments[0], {
+                var token = {xsrf_js};
+                if (!token) {{ cb({{error: 'XSRF-TOKEN missing'}}); return; }}
+                fetch('/api/v1/' + arguments[0], {{
                     method: 'POST',
-                    headers: {
+                    headers: {{
                         'Content-Type': 'application/json',
                         'Accept': 'application/json',
-                        'X-XSRF-TOKEN': decodeURIComponent(
-                            document.cookie.match(/XSRF-TOKEN=([^;]+)/)[1]
-                        ),
+                        'X-XSRF-TOKEN': decodeURIComponent(token),
                         'X-Requested-With': 'XMLHttpRequest'
-                    },
-                    body: JSON.stringify(arguments[1] || {})
-                }).then(async r => ({
+                    }},
+                    body: JSON.stringify(arguments[1] || {{}})
+                }}).then(async r => ({{
                     status: r.status, body: await r.json()
-                })).then(d => cb(d)).catch(e => cb({error: e.message}));
+                }})).then(d => cb(d)).catch(e => cb({{error: e.message}}));
             """, path, body or {})
             return result
 
@@ -494,6 +517,35 @@ UA = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Ch
 
 def dw_search(query, content_type=None):
     """Search DarkiWorld by text query. Returns list of title dicts."""
+    # Prefer browser API (authenticated, no Cloudflare issues)
+    if browser.logged_in and browser.driver:
+        try:
+            search_params = {"query": query, "perPage": 20}
+            if content_type == "movie":
+                search_params["type"] = "movie"
+            elif content_type == "series":
+                search_params["type"] = "series"
+            result = browser.api_get("titles", search_params)
+            if result and "pagination" in result:
+                data = result["pagination"].get("data", [])
+                results = []
+                for item in data:
+                    item_is_series = item.get("is_series", False)
+                    type_ok = True
+                    if content_type == "movie" and item_is_series:
+                        type_ok = False
+                    elif content_type == "series" and not item_is_series:
+                        type_ok = False
+                    if type_ok:
+                        results.append(item)
+                if results:
+                    print(f"[dw] Browser search '{query}': {len(results)} results")
+                    return results
+            print(f"[dw] Browser search '{query}': no results")
+        except Exception as e:
+            print(f"[dw] Browser search error: {e}")
+
+    # Fallback to public search API
     url = f"https://{DARKIWORLD_DOMAIN}/api/v1/search/{urllib.parse.quote(query)}"
     try:
         r = requests.get(url, params={"limit": 20}, timeout=15,
@@ -547,16 +599,49 @@ def dw_search_by_tmdb(tmdb_id, content_type=None):
             if result and isinstance(result, dict) and result.get("id") and "error" not in result:
                 print(f"[dw] TMDB {tmdb_id} found via browser API (direct): {result.get('name')}")
                 return result
-            print(f"[dw] TMDB {tmdb_id} not found via browser API, trying text search...")
+            print(f"[dw] TMDB {tmdb_id} not found via browser API tmdb_id param")
         except Exception as e:
             print(f"[dw] Browser API search error: {e}")
 
-    results = dw_search(str(tmdb_id), content_type)
-    for r in results:
-        if str(r.get("tmdb_id", "")) == str(tmdb_id):
-            print(f"[dw] TMDB {tmdb_id} found via text search: {r.get('name')}")
-            return r
-    print(f"[dw] TMDB {tmdb_id} not found in text search results")
+    # Fallback: look up title metadata from *arr APIs and search by name
+    arr_info = _lookup_title_from_arr(tmdb_id, content_type)
+    if arr_info:
+        arr_title = arr_info["title"]
+        arr_year = arr_info.get("year")
+        arr_imdb = arr_info.get("imdb_id")
+        print(f"[dw] Searching DW for '{arr_title}' (from *arr lookup, TMDB {tmdb_id})")
+        results = dw_search(arr_title, content_type)
+        # Prefer exact TMDB match
+        for r in results:
+            if str(r.get("tmdb_id", "")) == str(tmdb_id):
+                print(f"[dw] TMDB {tmdb_id} matched via tmdb_id: {r.get('name')}")
+                return r
+        # Prefer exact IMDB match
+        if arr_imdb:
+            for r in results:
+                if r.get("imdb_id") == arr_imdb:
+                    print(f"[dw] TMDB {tmdb_id} matched via imdb_id ({arr_imdb}): {r.get('name')}")
+                    return r
+        # Validate by year (+/-1 tolerance)
+        if arr_year:
+            year_matches = [r for r in results
+                            if r.get("year") and abs(int(r["year"]) - int(arr_year)) <= 1]
+            if len(year_matches) == 1:
+                print(f"[dw] TMDB {tmdb_id} matched via year ({arr_year}): {year_matches[0].get('name')}")
+                return year_matches[0]
+            if year_matches:
+                print(f"[dw] TMDB {tmdb_id} multiple year matches for '{arr_title}' ({arr_year}), "
+                      f"picking first: {year_matches[0].get('name')}")
+                return year_matches[0]
+            print(f"[dw] TMDB {tmdb_id} no year match for '{arr_title}' ({arr_year}) "
+                  f"among {[(r.get('name'), r.get('year')) for r in results]}")
+        elif len(results) == 1:
+            print(f"[dw] TMDB {tmdb_id} single result via name search: {results[0].get('name')}")
+            return results[0]
+        else:
+            print(f"[dw] TMDB {tmdb_id} {len(results)} results, cannot validate without year")
+
+    print(f"[dw] TMDB {tmdb_id} not found")
     return None
 
 
@@ -676,8 +761,11 @@ def _get_langs(lien):
     return [la.get("name", "") for la in lien.get("langues_compact", [])]
 
 
-def _get_lang_tag(lien):
-    """Build a scene-style language tag (MULTI, FRENCH, VOSTFR, etc.)."""
+def _get_lang_tag(lien, original_language=None):
+    """Build a scene-style language tag (MULTI, FRENCH, VOSTFR, etc.).
+    If the content's original language is French and the release is tagged
+    FRENCH (VF only), promote it to TRUEFRENCH so Radarr/Sonarr custom
+    formats that penalize VF-only releases don't reject it."""
     langs = _get_langs(lien)
     lang_str = " ".join(langs).lower()
     if "multi" in lang_str:
@@ -685,6 +773,10 @@ def _get_lang_tag(lien):
     if "truefrench" in lang_str:
         return "TRUEFRENCH"
     if "french" in lang_str or "vfi" in lang_str:
+        # For French-original content, FRENCH *is* the original language,
+        # so it's equivalent to TRUEFRENCH (not a dub-only release).
+        if original_language and original_language.lower() in ("fr", "french"):
+            return "TRUEFRENCH"
         return "FRENCH"
     if "vostfr" in lang_str:
         return "VOSTFR"
@@ -851,8 +943,8 @@ SONARR_KEY = os.environ.get("SONARR_KEY", "")
 
 
 def _lookup_title_from_arr(tmdb_id, content_type=None):
-    """Look up a title name from Radarr/Sonarr by TMDB ID.
-    Used as fallback when DarkiWorld TMDB search fails."""
+    """Look up title metadata from Radarr/Sonarr by TMDB ID.
+    Returns a dict with title, year, imdb_id (or None)."""
     tmdb_str = str(tmdb_id)
     # Try Radarr lookup (works even if movie isn't in library)
     if content_type != "series" and RADARR_URL and RADARR_KEY:
@@ -864,9 +956,13 @@ def _lookup_title_from_arr(tmdb_id, content_type=None):
             if isinstance(data, list) and data:
                 data = data[0]
             if isinstance(data, dict) and data.get("title"):
-                title = data.get("title") or data.get("originalTitle", "")
-                print(f"[arr] Radarr lookup: '{title}' for TMDB {tmdb_id}")
-                return title
+                info = {
+                    "title": data.get("title") or data.get("originalTitle", ""),
+                    "year": data.get("year"),
+                    "imdb_id": data.get("imdbId"),
+                }
+                print(f"[arr] Radarr lookup: '{info['title']}' ({info['year']}) for TMDB {tmdb_id}")
+                return info
         except Exception as e:
             print(f"[arr] Radarr lookup error: {e}")
     # Try Sonarr lookup
@@ -877,13 +973,52 @@ def _lookup_title_from_arr(tmdb_id, content_type=None):
                              headers={"X-Api-Key": SONARR_KEY}, timeout=10)
             data = r.json()
             if isinstance(data, list) and data:
-                title = data[0].get("title", "")
+                d = data[0]
+                title = d.get("title", "")
                 if title:
-                    print(f"[arr] Sonarr lookup: '{title}' for TMDB {tmdb_id}")
-                    return title
+                    info = {
+                        "title": title,
+                        "year": d.get("year"),
+                        "imdb_id": d.get("imdbId"),
+                    }
+                    print(f"[arr] Sonarr lookup: '{info['title']}' ({info['year']}) for TMDB {tmdb_id}")
+                    return info
         except Exception as e:
             print(f"[arr] Sonarr lookup error: {e}")
     print(f"[arr] TMDB {tmdb_id} not found via *arr lookup APIs")
+    return None
+
+
+def _lookup_original_language(tmdb_id, content_type=None):
+    """Look up the original language of a title from Radarr/Sonarr by TMDB ID.
+    Returns a language string like 'French', 'English', etc. or None."""
+    tmdb_str = str(tmdb_id)
+    if content_type != "series" and RADARR_URL and RADARR_KEY:
+        try:
+            r = requests.get(f"{RADARR_URL}/api/v3/movie/lookup/tmdb",
+                             params={"tmdbId": tmdb_str},
+                             headers={"X-Api-Key": RADARR_KEY}, timeout=10)
+            data = r.json()
+            if isinstance(data, list) and data:
+                data = data[0]
+            if isinstance(data, dict):
+                orig_lang = data.get("originalLanguage", {})
+                if isinstance(orig_lang, dict):
+                    return orig_lang.get("name", "")
+        except Exception:
+            pass
+    if content_type != "movie" and SONARR_URL and SONARR_KEY:
+        try:
+            r = requests.get(f"{SONARR_URL}/api/v3/series/lookup",
+                             params={"term": f"tmdb:{tmdb_str}"},
+                             headers={"X-Api-Key": SONARR_KEY}, timeout=10)
+            data = r.json()
+            if isinstance(data, list) and data:
+                orig_lang = data[0].get("originalLanguage", {})
+                if isinstance(orig_lang, dict):
+                    return orig_lang.get("name", "")
+        except Exception:
+            pass
     return None
 
 
@@ -953,12 +1088,13 @@ def _torznab_error_xml(code, description):
 
 
 def _lien_to_torznab_item(lien, title_name, title_year, title_type, title_id,
-                           tmdb_id=None, imdb_id=None, episode_tag=""):
+                           tmdb_id=None, imdb_id=None, episode_tag="",
+                           original_language=None):
     """Convert a DarkiWorld lien to a Torznab XML <item>."""
     lien_id = lien.get("id", 0)
     quality_id = lien.get("qualite", 0)
     quality_str = DW_QUALITY_TO_RELEASE.get(quality_id, "WEB-DL")
-    lang_tag = _get_lang_tag(lien)
+    lang_tag = _get_lang_tag(lien, original_language=original_language)
     size = lien.get("taille", 0) or 0
 
     release_name = _build_release_name(title_name, title_year, quality_str, lang_tag, episode_tag)
@@ -1047,6 +1183,23 @@ def handle_torznab_search(params):
     tmdb_id = params.get("tmdbid", [None])[0]
     imdb_id = params.get("imdbid", [None])[0]
     query = params.get("q", [""])[0]
+
+    # RSS/validation: Radarr/Sonarr/Prowlarr send queries with no search terms
+    # to validate the indexer. Return a dummy item so categories are detected.
+    if not query and not tmdb_id and not imdb_id:
+        from email.utils import formatdate
+        now_rfc2822 = formatdate(timeval=None, localtime=False, usegmt=True)
+        dummy = f"""  <item>
+    <title>Darkiarr.Test.2020.MULTi.1080p.WEB-DL.DarkiWorld</title>
+    <guid>darkiarr-rss-test</guid>
+    <link>http://localhost</link>
+    <pubDate>{now_rfc2822}</pubDate>
+    <enclosure url="http://localhost" length="1000000000" type="application/x-bittorrent" />
+    <category>2000</category>
+    <category>5000</category>
+    <size>1000000000</size>
+  </item>"""
+        return "application/xml", _wrap_torznab_results(dummy)
     season = params.get("season", [None])[0]
     ep = params.get("ep", [None])[0]
     offset = int(params.get("offset", [0])[0])
@@ -1076,21 +1229,7 @@ def handle_torznab_search(params):
         if not dw_titles:
             dw_titles = results[:5]
 
-    # Fallback: if we have tmdbid but no q, look up title name from Radarr/Sonarr
-    if not dw_titles and tmdb_id and not query:
-        print(f"[torznab] Fallback: looking up TMDB {tmdb_id} in *arr APIs...")
-        arr_title = _lookup_title_from_arr(tmdb_id, content_type_filter)
-        if arr_title:
-            print(f"[torznab] Fallback: searching DW for '{arr_title}' (from *arr API)")
-            results = dw_search(arr_title, content_type_filter)
-            if results:
-                # Prefer TMDB match
-                for r in results:
-                    if str(r.get("tmdb_id", "")) == str(tmdb_id):
-                        dw_titles.append(r)
-                        break
-                if not dw_titles:
-                    dw_titles = results[:3]
+    # Note: dw_search_by_tmdb already handles *arr fallback + validation
 
     if not dw_titles:
         print(f"[torznab] No results for tmdb={tmdb_id} q={query}")
@@ -1107,6 +1246,14 @@ def handle_torznab_search(params):
         title_imdb = dw_title.get("imdb_id") or imdb_id
 
         print(f"[torznab] {t}: {title_name} ({title_year}) [DW:{title_id}] tmdb={title_tmdb}")
+
+        # Look up original language so FRENCH releases on French-original
+        # content get promoted to TRUEFRENCH (avoids custom format rejection).
+        orig_lang = None
+        if title_tmdb:
+            orig_lang = _lookup_original_language(title_tmdb, content_type_filter)
+            if orig_lang:
+                print(f"[torznab] Original language: {orig_lang}")
 
         season_num = int(season) if season else 1
         liens = dw_get_liens(title_id, season=season_num)
@@ -1132,7 +1279,7 @@ def handle_torznab_search(params):
                 elif season:
                     episode_tag = f"S{season_num:02d}"
 
-            key = (title_id, lien.get("qualite"), _get_lang_tag(lien), episode_tag)
+            key = (title_id, lien.get("qualite"), _get_lang_tag(lien, original_language=orig_lang), episode_tag)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -1140,6 +1287,7 @@ def handle_torznab_search(params):
             all_items.append(_lien_to_torznab_item(
                 lien, title_name, title_year, title_type, title_id,
                 tmdb_id=title_tmdb, imdb_id=title_imdb, episode_tag=episode_tag,
+                original_language=orig_lang,
             ))
 
     # Apply pagination
